@@ -15,7 +15,7 @@ Claude CLI  →  proxy (:8082)  →  Ollama (:11434)  →  local LLM
 ## Installation
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/shansin/claude-model-proxy.git
 cd claude-model-proxy
 uv sync
 ```
@@ -52,17 +52,17 @@ proxy_port: 8082
 
 # Map Claude model name fragments to Ollama models (substring match, case-insensitive)
 model_map:
-  opus:    llama3.2:70b
-  sonnet:  llama3.2
-  haiku:   llama3.2:1b
-  default: llama3.2
+  opus:    glm-4.7-flash:latest
+  sonnet:  glm-4.7-flash:latest
+  haiku:   glm-4.7-flash:latest
+  default: glm-4.7-flash:latest
 
 # Context window size per model class
 context_size:
   opus:    32768
-  sonnet:  16384
+  sonnet:  32768
   haiku:   8192
-  default: 8192
+  default: 32768
 ```
 
 ### Environment variable overrides
@@ -74,7 +74,7 @@ Individual config values can be overridden with environment variables (useful fo
 | `OLLAMA_BASE_URL` | Ollama server URL |
 | `PROXY_HOST` | Host the proxy binds to |
 | `PROXY_PORT` | Port the proxy listens on |
-| `OLLAMA_MODEL_MAP_<KEY>` | Override a model mapping, e.g. `OLLAMA_MODEL_MAP_OPUS=llama3.2:70b` |
+| `OLLAMA_MODEL_MAP_<KEY>` | Override a model mapping, e.g. `OLLAMA_MODEL_MAP_OPUS=glm-4.7-flash:latest` |
 | `OLLAMA_CONTEXT_SIZE_<KEY>` | Override context size, e.g. `OLLAMA_CONTEXT_SIZE_SONNET=32768` |
 | `CONFIG_PATH` | Path to a custom config file |
 
