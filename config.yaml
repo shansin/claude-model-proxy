@@ -19,5 +19,5 @@ model_map:
 context_size:
   opus:    40000
   sonnet:  40000
-  haiku:   8192
+  haiku:   40000
   default: 32768

@@ -159,6 +159,12 @@ def resolve_context_size(cfg: dict, claude_model: str) -> int | None:
     return cfg["context_size"].get(key or "default")
 
 
+def estimate_tokens(messages: list[dict]) -> int:
+    """Rough estimate: ~4 chars per token."""
+    total = sum(len(str(m.get("content", ""))) for m in messages)
+    return total // 4
+
+
 def build_ollama_messages(body: dict) -> list[dict]:
     messages = []
 
@@ -274,6 +280,8 @@ async def stream_anthropic_events(
     msg_id: str,
     ollama_model: str,
     t0: float,
+    ctx_size: int | None = None,
+    est_input_tokens: int = 0,
 ) -> AsyncIterator[str]:
     def sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -288,7 +296,7 @@ async def stream_anthropic_events(
             "model": claude_model,
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": {"input_tokens": est_input_tokens, "output_tokens": 0},
         },
     })
     yield sse("ping", {"type": "ping"})
@@ -340,6 +348,11 @@ async def stream_anthropic_events(
                 "⇐ ollama  [%s]  %s  %din %dout tok  %.3fs",
                 msg_id[:8], stop_reason, input_tokens, output_tokens, elapsed,
             )
+            if ctx_size is not None and input_tokens > ctx_size:
+                log.warning(
+                    "\033[31m⚠ context overflow  [%s]  actual %d tokens > configured ctx=%d\033[0m",
+                    msg_id[:8], input_tokens, ctx_size,
+                )
 
     # Close text block if one was opened
     next_index = 0
@@ -378,7 +391,7 @@ async def stream_anthropic_events(
     yield sse("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens},
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
     })
     yield sse("message_stop", {"type": "message_stop"})
 
@@ -398,6 +411,14 @@ async def messages(request: Request) -> Response:
     ollama_messages = build_ollama_messages(body)
     stream = body.get("stream", False)
     msg_id = f"msg_{uuid.uuid4().hex}"
+
+    if ctx_size is not None:
+        est_tokens = estimate_tokens(ollama_messages)
+        if est_tokens > ctx_size:
+            log.warning(
+                "\033[31m⚠ context overflow  [%s]  estimated ~%d tokens > configured ctx=%d\033[0m",
+                msg_id[:8], est_tokens, ctx_size,
+            )
 
     turn = len(body.get("messages", []))
     client_ip = request.client.host if request.client else "unknown"
@@ -468,7 +489,8 @@ async def messages(request: Request) -> Response:
                                                      "usage": {"output_tokens": 0}})
                         yield _sse("message_stop", {"type": "message_stop"})
                         return
-                    async for event in stream_anthropic_events(resp.aiter_lines(), claude_model, msg_id, ollama_model, t0):
+                    est_tok = estimate_tokens(ollama_messages)
+                    async for event in stream_anthropic_events(resp.aiter_lines(), claude_model, msg_id, ollama_model, t0, ctx_size, est_input_tokens=est_tok):
                         yield event
             log.info("← proxy   [%s]  ok", msg_id[:8])
 
@@ -493,6 +515,11 @@ async def messages(request: Request) -> Response:
             "⇐ ollama  [%s]  %s  %din %dout tok  %.3fs",
             msg_id[:8], stop_reason, in_tok, out_tok, elapsed,
         )
+        if ctx_size is not None and in_tok > ctx_size:
+            log.warning(
+                "\033[31m⚠ context overflow  [%s]  actual %d tokens > configured ctx=%d\033[0m",
+                msg_id[:8], in_tok, ctx_size,
+            )
         log.info("← proxy   [%s]  ok", msg_id[:8])
         return Response(
             content=json.dumps(build_anthropic_response(ollama_data, claude_model, msg_id)),
