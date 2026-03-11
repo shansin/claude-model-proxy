@@ -270,7 +270,12 @@ def build_anthropic_response(ollama_resp: dict, claude_model: str, msg_id: str) 
         "model": claude_model,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
     }
 
 
@@ -296,7 +301,12 @@ async def stream_anthropic_events(
             "model": claude_model,
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": est_input_tokens, "output_tokens": 0},
+            "usage": {
+                "input_tokens": est_input_tokens,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
         },
     })
     yield sse("ping", {"type": "ping"})
@@ -391,7 +401,7 @@ async def stream_anthropic_events(
     yield sse("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        "usage": {"output_tokens": output_tokens},
     })
     yield sse("message_stop", {"type": "message_stop"})
 
@@ -476,7 +486,9 @@ async def messages(request: Request) -> Response:
                             "message": {"id": msg_id, "type": "message", "role": "assistant",
                                         "content": [], "model": claude_model,
                                         "stop_reason": None, "stop_sequence": None,
-                                        "usage": {"input_tokens": 0, "output_tokens": 0}},
+                                        "usage": {"input_tokens": 0, "output_tokens": 0,
+                                                  "cache_creation_input_tokens": 0,
+                                                  "cache_read_input_tokens": 0}},
                         })
                         yield _sse("content_block_start", {"type": "content_block_start", "index": 0,
                                                             "content_block": {"type": "text", "text": ""}})
