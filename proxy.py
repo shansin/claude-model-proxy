@@ -165,6 +165,83 @@ def estimate_tokens(messages: list[dict]) -> int:
     return total // 4
 
 
+def _msg_tokens(msg: dict) -> int:
+    """Estimate tokens for a single message."""
+    return len(str(msg.get("content", ""))) // 4
+
+
+def trim_messages(messages: list[dict], ctx_size: int, msg_id: str) -> list[dict]:
+    """Drop oldest non-system messages until estimated tokens fit within ctx_size.
+
+    Reserves 25% of context for the response.  Keeps the system prompt (first
+    message if role=system) and the most recent messages.
+    """
+    budget = int(ctx_size * 0.75)  # leave room for output
+    est = estimate_tokens(messages)
+    if est <= budget:
+        return messages
+
+    # Separate system prompt from conversation
+    system_msgs: list[dict] = []
+    conv_msgs: list[dict] = list(messages)
+    if conv_msgs and conv_msgs[0].get("role") == "system":
+        system_msgs = [conv_msgs.pop(0)]
+
+    system_cost = estimate_tokens(system_msgs)
+    remaining_budget = budget - system_cost
+
+    # Keep messages from the end until budget is exhausted
+    kept: list[dict] = []
+    running = 0
+    for msg in reversed(conv_msgs):
+        cost = _msg_tokens(msg)
+        if running + cost > remaining_budget:
+            break
+        kept.append(msg)
+        running += cost
+    kept.reverse()
+
+    dropped = len(conv_msgs) - len(kept)
+    if dropped > 0:
+        log.warning(
+            "\033[33m⚠ context trim  [%s]  dropped %d oldest messages "
+            "(~%d→~%d tokens, budget=%d)\033[0m",
+            msg_id[:8], dropped, est, system_cost + running, budget,
+        )
+
+    return system_msgs + kept
+
+
+def _log_tool_use(name: str, inp: dict) -> None:
+    """Log a tool_use block in a human-readable format."""
+    def _summarize(value: Any, max_len: int = 80) -> str:
+        s = str(value)
+        if len(s) > max_len:
+            return s[:max_len] + "…"
+        return s
+
+    if not inp:
+        log.info("  \033[36m⚙ %s\033[0m()", name)
+        return
+
+    parts: list[str] = []
+    for k, v in inp.items():
+        if isinstance(v, str) and len(v) > 120:
+            # Show length for long strings (file contents, code, etc.)
+            lines = v.count("\n") + 1
+            parts.append(f"{k}: ({len(v)} chars, {lines} lines)")
+        elif isinstance(v, (dict, list)):
+            summary = json.dumps(v, separators=(",", ":"))
+            if len(summary) > 100:
+                parts.append(f"{k}: {summary[:100]}…")
+            else:
+                parts.append(f"{k}: {summary}")
+        else:
+            parts.append(f"{k}: {_summarize(v)}")
+
+    log.info("  \033[36m⚙ %s\033[0m  %s", name, "  ".join(parts))
+
+
 def build_ollama_messages(body: dict) -> list[dict]:
     messages = []
 
@@ -191,7 +268,7 @@ def build_ollama_messages(body: dict) -> list[dict]:
                 if block.get("type") == "text":
                     text_parts.append(block.get("text", ""))
                 elif block.get("type") == "tool_use":
-                    log.info("  tool_use  %s\n%s", block.get("name"), json.dumps(block.get("input", {}), indent=2))
+                    _log_tool_use(block.get("name", ""), block.get("input", {}))
                     tool_calls.append({
                         "id": block.get("id", ""),
                         "function": {
@@ -228,13 +305,26 @@ def build_ollama_messages(body: dict) -> list[dict]:
     return messages
 
 
-def build_anthropic_response(ollama_resp: dict, claude_model: str, msg_id: str) -> dict:
+def _detect_stop_sequence(text: str, stop_sequences: list[str] | None) -> str | None:
+    """Return the stop sequence that the text ends with, or None."""
+    if not stop_sequences or not text:
+        return None
+    for seq in stop_sequences:
+        if text.endswith(seq):
+            return seq
+    return None
+
+
+def build_anthropic_response(
+    ollama_resp: dict, claude_model: str, msg_id: str,
+    stop_sequences: list[str] | None = None,
+) -> dict:
     message = ollama_resp.get("message", {})
     text = message.get("content", "")
     tool_calls = message.get("tool_calls", [])
-    input_tokens = ollama_resp.get("prompt_eval_count", 0)
-    output_tokens = ollama_resp.get("eval_count", 0)
-    done_reason = ollama_resp.get("done_reason", "stop")
+    input_tokens = ollama_resp.get("prompt_eval_count") or 0
+    output_tokens = ollama_resp.get("eval_count") or 0
+    done_reason = ollama_resp.get("done_reason") or "stop"
 
     content: list[dict] = []
     if text:
@@ -254,8 +344,11 @@ def build_anthropic_response(ollama_resp: dict, claude_model: str, msg_id: str) 
             "input": args,
         })
 
+    matched_seq = _detect_stop_sequence(text, stop_sequences)
     if tool_calls:
         stop_reason = "tool_use"
+    elif matched_seq is not None:
+        stop_reason = "stop_sequence"
     else:
         stop_reason = {"stop": "end_turn", "length": "max_tokens"}.get(done_reason, "end_turn")
 
@@ -269,7 +362,7 @@ def build_anthropic_response(ollama_resp: dict, claude_model: str, msg_id: str) 
         "content": content,
         "model": claude_model,
         "stop_reason": stop_reason,
-        "stop_sequence": None,
+        "stop_sequence": matched_seq,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -287,6 +380,7 @@ async def stream_anthropic_events(
     t0: float,
     ctx_size: int | None = None,
     est_input_tokens: int = 0,
+    stop_sequences: list[str] | None = None,
 ) -> AsyncIterator[str]:
     def sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -314,6 +408,8 @@ async def stream_anthropic_events(
     input_tokens = 0
     output_tokens = 0
     stop_reason = "end_turn"
+    matched_stop_seq: str | None = None
+    accumulated_text = ""
     text_block_started = False
     accumulated_tool_calls: list[dict] = []
 
@@ -328,6 +424,7 @@ async def stream_anthropic_events(
         msg = data.get("message", {})
 
         if text_delta := msg.get("content", ""):
+            accumulated_text += text_delta
             if not text_block_started:
                 yield sse("content_block_start", {
                     "type": "content_block_start",
@@ -345,18 +442,22 @@ async def stream_anthropic_events(
             accumulated_tool_calls.extend(tool_calls)
 
         if data.get("done"):
-            input_tokens = data.get("prompt_eval_count", 0)
-            output_tokens = data.get("eval_count", 0)
+            input_tokens = data.get("prompt_eval_count") or 0
+            output_tokens = data.get("eval_count") or 0
+            matched_stop_seq = _detect_stop_sequence(accumulated_text, stop_sequences)
             if accumulated_tool_calls:
                 stop_reason = "tool_use"
+            elif matched_stop_seq is not None:
+                stop_reason = "stop_sequence"
             else:
                 stop_reason = {"stop": "end_turn", "length": "max_tokens"}.get(
                     data.get("done_reason", "stop"), "end_turn"
                 )
             elapsed = time.monotonic() - t0
+            tps = output_tokens / elapsed if elapsed > 0 else 0
             log.info(
-                "⇐ ollama  [%s]  %s  %din %dout tok  %.3fs",
-                msg_id[:8], stop_reason, input_tokens, output_tokens, elapsed,
+                "⇐ ollama  [%s]  %s  %din %dout tok  %.3fs  %.1f tok/s",
+                msg_id[:8], stop_reason, input_tokens, output_tokens, elapsed, tps,
             )
             if ctx_size is not None and input_tokens > ctx_size:
                 log.warning(
@@ -396,11 +497,16 @@ async def stream_anthropic_events(
             "index": 0,
             "content_block": {"type": "text", "text": ""},
         })
+        yield sse("content_block_delta", {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": ""},
+        })
         yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
 
     yield sse("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "delta": {"stop_reason": stop_reason, "stop_sequence": matched_stop_seq},
         "usage": {"output_tokens": output_tokens},
     })
     yield sse("message_stop", {"type": "message_stop"})
@@ -423,12 +529,7 @@ async def messages(request: Request) -> Response:
     msg_id = f"msg_{uuid.uuid4().hex}"
 
     if ctx_size is not None:
-        est_tokens = estimate_tokens(ollama_messages)
-        if est_tokens > ctx_size:
-            log.warning(
-                "\033[31m⚠ context overflow  [%s]  estimated ~%d tokens > configured ctx=%d\033[0m",
-                msg_id[:8], est_tokens, ctx_size,
-            )
+        ollama_messages = trim_messages(ollama_messages, ctx_size, msg_id)
 
     turn = len(body.get("messages", []))
     client_ip = request.client.host if request.client else "unknown"
@@ -463,6 +564,10 @@ async def messages(request: Request) -> Response:
         options["num_predict"] = body["max_tokens"]
     if "temperature" in body:
         options["temperature"] = body["temperature"]
+    if "top_p" in body:
+        options["top_p"] = body["top_p"]
+    if "stop_sequences" in body:
+        options["stop"] = body["stop_sequences"]
     if options:
         ollama_payload["options"] = options
 
@@ -470,40 +575,49 @@ async def messages(request: Request) -> Response:
 
     if stream:
         async def generate():
+            def _sse(event: str, data: dict) -> str:
+                return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+            def _error_stream(error_text: str):
+                """Yield a complete SSE sequence containing an error message."""
+                yield _sse("message_start", {
+                    "type": "message_start",
+                    "message": {"id": msg_id, "type": "message", "role": "assistant",
+                                "content": [], "model": claude_model,
+                                "stop_reason": None, "stop_sequence": None,
+                                "usage": {"input_tokens": 0, "output_tokens": 0,
+                                          "cache_creation_input_tokens": 0,
+                                          "cache_read_input_tokens": 0}},
+                })
+                yield _sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                                    "content_block": {"type": "text", "text": ""}})
+                yield _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                   "delta": {"type": "text_delta", "text": error_text}})
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+                yield _sse("message_delta", {"type": "message_delta",
+                                             "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                             "usage": {"output_tokens": 0}})
+                yield _sse("message_stop", {"type": "message_stop"})
+
             log.info("⇒ ollama  [%s]  %s  ctx=%s", msg_id[:8], ollama_model, ctx_size)
             t0 = time.monotonic()
-            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None)) as client:
-                async with client.stream("POST", ollama_url, json=ollama_payload) as resp:
-                    if resp.status_code != 200:
-                        error_body = await resp.aread()
-                        log.error("ollama %d: %s", resp.status_code, error_body.decode())
-                        # Headers already sent; emit a valid terminal SSE sequence
-                        # so the client doesn't hang waiting for message_stop.
-                        def _sse(event: str, data: dict) -> str:
-                            return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-                        yield _sse("message_start", {
-                            "type": "message_start",
-                            "message": {"id": msg_id, "type": "message", "role": "assistant",
-                                        "content": [], "model": claude_model,
-                                        "stop_reason": None, "stop_sequence": None,
-                                        "usage": {"input_tokens": 0, "output_tokens": 0,
-                                                  "cache_creation_input_tokens": 0,
-                                                  "cache_read_input_tokens": 0}},
-                        })
-                        yield _sse("content_block_start", {"type": "content_block_start", "index": 0,
-                                                            "content_block": {"type": "text", "text": ""}})
-                        yield _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
-                                                           "delta": {"type": "text_delta",
-                                                                     "text": f"[Ollama error {resp.status_code}]"}})
-                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
-                        yield _sse("message_delta", {"type": "message_delta",
-                                                     "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                                                     "usage": {"output_tokens": 0}})
-                        yield _sse("message_stop", {"type": "message_stop"})
-                        return
-                    est_tok = estimate_tokens(ollama_messages)
-                    async for event in stream_anthropic_events(resp.aiter_lines(), claude_model, msg_id, ollama_model, t0, ctx_size, est_input_tokens=est_tok):
-                        yield event
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None)) as client:
+                    async with client.stream("POST", ollama_url, json=ollama_payload) as resp:
+                        if resp.status_code != 200:
+                            error_body = await resp.aread()
+                            log.error("ollama %d: %s", resp.status_code, error_body.decode())
+                            for event in _error_stream(f"[Ollama error {resp.status_code}]"):
+                                yield event
+                            return
+                        est_tok = estimate_tokens(ollama_messages)
+                        async for event in stream_anthropic_events(resp.aiter_lines(), claude_model, msg_id, ollama_model, t0, ctx_size, est_input_tokens=est_tok, stop_sequences=body.get("stop_sequences")):
+                            yield event
+            except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+                log.error("ollama connection error: %s", exc)
+                for event in _error_stream(f"[Ollama connection error: {exc}]"):
+                    yield event
+                return
             log.info("← proxy   [%s]  ok", msg_id[:8])
 
         return StreamingResponse(
@@ -517,15 +631,28 @@ async def messages(request: Request) -> Response:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None)) as client:
             resp = await client.post(ollama_url, json=ollama_payload)
             if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+                log.error("ollama %d: %s", resp.status_code, resp.text)
+                error_body = {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"Ollama returned {resp.status_code}: {resp.text}",
+                    },
+                }
+                return Response(
+                    content=json.dumps(error_body),
+                    status_code=resp.status_code,
+                    media_type="application/json",
+                )
             ollama_data = resp.json()
         elapsed = time.monotonic() - t0
-        in_tok = ollama_data.get("prompt_eval_count", 0)
-        out_tok = ollama_data.get("eval_count", 0)
+        in_tok = ollama_data.get("prompt_eval_count") or 0
+        out_tok = ollama_data.get("eval_count") or 0
+        tps = out_tok / elapsed if elapsed > 0 else 0
         stop_reason = "tool_use" if ollama_data.get("message", {}).get("tool_calls") else "end_turn"
         log.info(
-            "⇐ ollama  [%s]  %s  %din %dout tok  %.3fs",
-            msg_id[:8], stop_reason, in_tok, out_tok, elapsed,
+            "⇐ ollama  [%s]  %s  %din %dout tok  %.3fs  %.1f tok/s",
+            msg_id[:8], stop_reason, in_tok, out_tok, elapsed, tps,
         )
         if ctx_size is not None and in_tok > ctx_size:
             log.warning(
@@ -534,7 +661,7 @@ async def messages(request: Request) -> Response:
             )
         log.info("← proxy   [%s]  ok", msg_id[:8])
         return Response(
-            content=json.dumps(build_anthropic_response(ollama_data, claude_model, msg_id)),
+            content=json.dumps(build_anthropic_response(ollama_data, claude_model, msg_id, stop_sequences=body.get("stop_sequences"))),
             media_type="application/json",
         )
 
