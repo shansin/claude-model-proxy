@@ -17,7 +17,7 @@ model_map:
 # Omit a key to use the Ollama model's built-in default.
 # Override with env vars: OLLAMA_CONTEXT_SIZE_OPUS, OLLAMA_CONTEXT_SIZE_SONNET, etc.
 context_size:
-  opus:    40000
-  sonnet:  40000
-  haiku:   40000
-  default: 32768
+  opus:    110000
+  sonnet:  110000
+  haiku:   110000
+  default: 110000
