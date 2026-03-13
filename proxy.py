@@ -1,19 +1,21 @@
 """
-Claude CLI -> Ollama proxy
+Claude CLI -> Ollama proxy (with optional Anthropic passthrough)
 
 Exposes the Anthropic Messages API (/v1/messages) and forwards requests
 to a configurable Ollama endpoint, translating formats in both directions.
 
-Configuration is loaded at startup from config.yaml (or a path set via
-CONFIG_PATH env var). Individual values can be overridden with env vars:
+If a model_map entry is set to the special value "anthropic", the request
+is forwarded directly to the real Anthropic API instead of Ollama.
 
-  OLLAMA_BASE_URL              overrides ollama_base_url
-  OLLAMA_MODEL_MAP_<KEY>       overrides a model_map entry, e.g.
-                               OLLAMA_MODEL_MAP_OPUS=llama3.2:70b
-  OLLAMA_CONTEXT_SIZE_<KEY>    overrides a context_size entry, e.g.
-                               OLLAMA_CONTEXT_SIZE_SONNET=32768
-  PROXY_HOST                   overrides proxy_host (default: localhost)
-  PROXY_PORT                   overrides proxy_port (default: 8082)
+Configuration is loaded from environment variables (via .env file):
+
+  OLLAMA_BASE_URL              Ollama server URL (default: http://localhost:11434)
+  OLLAMA_MODEL_MAP_<KEY>       Model mapping, e.g. OLLAMA_MODEL_MAP_OPUS=llama3.2:70b
+  OLLAMA_CONTEXT_SIZE_<KEY>    Context size, e.g. OLLAMA_CONTEXT_SIZE_SONNET=32768
+  PROXY_HOST                   Host to listen on (default: localhost)
+  PROXY_PORT                   Port to listen on (default: 8082)
+  ANTHROPIC_API_KEY            API key for Anthropic passthrough
+  ANTHROPIC_BASE_URL           Anthropic API URL (default: https://api.anthropic.com)
 
 Run directly:
   uv run python proxy.py
@@ -29,7 +31,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import httpx
-import yaml
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
@@ -55,51 +57,18 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 # Config loading
 # ---------------------------------------------------------------------------
 
-_CONFIG_PATH = Path(os.getenv("CONFIG_PATH", Path(__file__).parent / "config.yaml"))
-
-_DEFAULTS: dict[str, Any] = {
-    "ollama_base_url": "http://localhost:11434",
-    "proxy_host": "localhost",
-    "proxy_port": 8082,
-    "model_map": {
-        "opus":    "llama3.2:70b",
-        "sonnet":  "llama3.2",
-        "haiku":   "llama3.2:1b",
-        "default": "llama3.2",
-    },
-    "context_size": {
-        "opus":    32768,
-        "sonnet":  16384,
-        "haiku":   8192,
-        "default": 8192,
-    },
-}
-
 
 def load_config() -> dict[str, Any]:
-    cfg: dict[str, Any] = json.loads(json.dumps(_DEFAULTS))  # deep copy
-
-    if _CONFIG_PATH.exists():
-        with _CONFIG_PATH.open() as f:
-            file_cfg = yaml.safe_load(f) or {}
-        cfg["ollama_base_url"] = file_cfg.get("ollama_base_url", cfg["ollama_base_url"])
-        cfg["proxy_host"] = file_cfg.get("proxy_host", cfg["proxy_host"])
-        cfg["proxy_port"] = int(file_cfg.get("proxy_port", cfg["proxy_port"]))
-        if "model_map" in file_cfg and isinstance(file_cfg["model_map"], dict):
-            cfg["model_map"].update(file_cfg["model_map"])
-        if "context_size" in file_cfg and isinstance(file_cfg["context_size"], dict):
-            cfg["context_size"].update(file_cfg["context_size"])
-        log.info("config    loaded from %s", _CONFIG_PATH)
-    else:
-        log.warning("config    not found at %s — using defaults", _CONFIG_PATH)
-
-    # Env var overrides
-    if base_url := os.getenv("OLLAMA_BASE_URL"):
-        cfg["ollama_base_url"] = base_url
-    if host := os.getenv("PROXY_HOST"):
-        cfg["proxy_host"] = host
-    if port := os.getenv("PROXY_PORT"):
-        cfg["proxy_port"] = int(port)
+    """Build configuration entirely from environment variables."""
+    cfg: dict[str, Any] = {
+        "ollama_base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        "anthropic_base_url": os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+        "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
+        "proxy_host": os.getenv("PROXY_HOST", "localhost"),
+        "proxy_port": int(os.getenv("PROXY_PORT", "8082")),
+        "model_map": {},
+        "context_size": {},
+    }
 
     for key, val in os.environ.items():
         # OLLAMA_MODEL_MAP_OPUS=llama3.2:70b  ->  model_map["opus"] = "llama3.2:70b"
@@ -111,6 +80,7 @@ def load_config() -> dict[str, Any]:
             ctx_key = key[len("OLLAMA_CONTEXT_SIZE_"):].lower()
             cfg["context_size"][ctx_key] = int(val)
 
+    log.info("config    loaded from environment")
     return cfg
 
 
@@ -118,15 +88,36 @@ def load_config() -> dict[str, Any]:
 # App lifecycle
 # ---------------------------------------------------------------------------
 
+_ANTHROPIC_PASSTHROUGH = "anthropic"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = load_config()
     app.state.config = cfg
-    log.info("ollama    %s", cfg["ollama_base_url"])
+
+    has_models = bool(cfg["model_map"])
+
+    if has_models:
+        log.info("ollama    %s", cfg["ollama_base_url"])
+
+    key_hint = "set" if cfg.get("anthropic_api_key") else "from request"
+    if has_models:
+        log.info("anthropic %s  (api_key: %s)  (fallback for unmapped models)", cfg["anthropic_base_url"], key_hint)
+    else:
+        log.info("anthropic %s  (api_key: %s)  (all models)", cfg["anthropic_base_url"], key_hint)
+
     for key in cfg["model_map"]:
         label = key if key != "default" else "(default)"
-        ctx = cfg["context_size"].get(key, cfg["context_size"].get("default", "—"))
-        log.info("model     %-10s → %-22s ctx=%s", label, cfg["model_map"][key], ctx)
+        target = cfg["model_map"][key]
+        if target == _ANTHROPIC_PASSTHROUGH:
+            log.info("model     %-10s → %-22s (anthropic passthrough)", label, target)
+        else:
+            ctx = cfg["context_size"].get(key, cfg["context_size"].get("default", "—"))
+            log.info("model     %-10s → %-22s ctx=%s", label, target, ctx)
+
+    if not has_models:
+        log.info("model     (all)      → anthropic  (no model_map entries)")
 
     proxy_url = f"http://{cfg['proxy_host']}:{cfg['proxy_port']}"
     log.info("ready     export ANTHROPIC_BASE_URL=%s ANTHROPIC_API_KEY=proxy ; claude", proxy_url)
@@ -149,9 +140,12 @@ def _match_key(cfg_dict: dict, claude_model: str) -> str | None:
     return None
 
 
-def resolve_ollama_model(cfg: dict, claude_model: str) -> str:
+def resolve_ollama_model(cfg: dict, claude_model: str) -> str | None:
+    """Return the Ollama model name for a Claude model, or None if unmapped."""
     key = _match_key(cfg["model_map"], claude_model)
-    return cfg["model_map"][key] if key else cfg["model_map"].get("default", "llama3.2")
+    if key:
+        return cfg["model_map"][key]
+    return cfg["model_map"].get("default")
 
 
 def resolve_context_size(cfg: dict, claude_model: str) -> int | None:
@@ -513,6 +507,132 @@ async def stream_anthropic_events(
 
 
 # ---------------------------------------------------------------------------
+# Anthropic passthrough
+# ---------------------------------------------------------------------------
+
+def _resolve_anthropic_api_key(cfg: dict, request: Request) -> str:
+    """Return the API key to use for Anthropic passthrough.
+
+    Prefers a configured key; falls back to the key from the incoming request
+    (unless it is the dummy value 'proxy').
+    """
+    if configured := cfg.get("anthropic_api_key"):
+        return configured
+    from_header = request.headers.get("x-api-key", "")
+    if from_header and from_header.lower() != "proxy":
+        return from_header
+    return ""
+
+
+async def _forward_to_anthropic(
+    cfg: dict,
+    request: Request,
+    body: dict,
+    claude_model: str,
+    msg_id: str,
+) -> Response:
+    """Forward the request directly to the Anthropic API."""
+    api_key = _resolve_anthropic_api_key(cfg, request)
+    if not api_key:
+        log.error("anthropic passthrough: no API key available")
+        raise HTTPException(status_code=500, detail="No Anthropic API key configured for passthrough")
+
+    anthropic_url = f"{cfg['anthropic_base_url'].rstrip('/')}/v1/messages"
+    stream = body.get("stream", False)
+    turn = len(body.get("messages", []))
+    client_ip = request.client.host if request.client else "unknown"
+    log.info(
+        "→ proxy   [%s]  %s  %s → anthropic  turns=%d  stream=%s",
+        msg_id[:8], client_ip, claude_model, turn, stream,
+    )
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
+        "content-type": "application/json",
+    }
+    # Forward optional beta headers
+    if beta := request.headers.get("anthropic-beta"):
+        headers["anthropic-beta"] = beta
+
+    if stream:
+        async def generate():
+            def _sse(event: str, data: dict) -> str:
+                return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+            def _error_stream(error_text: str):
+                """Yield a complete SSE error as a valid Anthropic message."""
+                yield _sse("message_start", {
+                    "type": "message_start",
+                    "message": {"id": msg_id, "type": "message", "role": "assistant",
+                                "content": [], "model": claude_model,
+                                "stop_reason": None, "stop_sequence": None,
+                                "usage": {"input_tokens": 0, "output_tokens": 0,
+                                          "cache_creation_input_tokens": 0,
+                                          "cache_read_input_tokens": 0}},
+                })
+                yield _sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                                    "content_block": {"type": "text", "text": ""}})
+                yield _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                   "delta": {"type": "text_delta", "text": error_text}})
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+                yield _sse("message_delta", {"type": "message_delta",
+                                             "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                             "usage": {"output_tokens": 0}})
+                yield _sse("message_stop", {"type": "message_stop"})
+
+            log.info("⇒ anthropic [%s]  %s  stream", msg_id[:8], claude_model)
+            t0 = time.monotonic()
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None)) as client:
+                    async with client.stream("POST", anthropic_url, json=body, headers=headers) as resp:
+                        if resp.status_code != 200:
+                            error_body = await resp.aread()
+                            error_text = error_body.decode()[:500]
+                            log.error("anthropic %d: %s", resp.status_code, error_text)
+                            # Parse error message if possible
+                            try:
+                                err_json = json.loads(error_body)
+                                err_msg = err_json.get("error", {}).get("message", error_text)
+                            except (json.JSONDecodeError, AttributeError):
+                                err_msg = error_text
+                            for event in _error_stream(f"[Anthropic error {resp.status_code}] {err_msg}"):
+                                yield event
+                            return
+                        async for line in resp.aiter_lines():
+                            if line:
+                                yield line + "\n"
+            except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+                log.error("anthropic connection error: %s", exc)
+                for event in _error_stream(f"[Anthropic connection error: {exc}]"):
+                    yield event
+                return
+            elapsed = time.monotonic() - t0
+            log.info("← proxy   [%s]  anthropic ok  %.3fs", msg_id[:8], elapsed)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    else:
+        log.info("⇒ anthropic [%s]  %s  non-stream", msg_id[:8], claude_model)
+        t0 = time.monotonic()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None)) as client:
+            resp = await client.post(anthropic_url, json=body, headers=headers)
+        elapsed = time.monotonic() - t0
+        if resp.status_code != 200:
+            log.error("anthropic %d: %s", resp.status_code, resp.text[:500])
+        else:
+            log.info("← proxy   [%s]  anthropic ok  %.3fs", msg_id[:8], elapsed)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type="application/json",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -522,11 +642,17 @@ async def messages(request: Request) -> Response:
     body = await request.json()
 
     claude_model = body.get("model", "claude-sonnet-4-6")
+    msg_id = f"msg_{uuid.uuid4().hex}"
+
+    # --- Anthropic passthrough (no local model defined, or explicit "anthropic" value) ---
     ollama_model = resolve_ollama_model(cfg, claude_model)
+    if ollama_model is None or ollama_model == _ANTHROPIC_PASSTHROUGH:
+        return await _forward_to_anthropic(cfg, request, body, claude_model, msg_id)
+
+    # --- Ollama path ---
     ctx_size = resolve_context_size(cfg, claude_model)
     ollama_messages = build_ollama_messages(body)
     stream = body.get("stream", False)
-    msg_id = f"msg_{uuid.uuid4().hex}"
 
     if ctx_size is not None:
         ollama_messages = trim_messages(ollama_messages, ctx_size, msg_id)

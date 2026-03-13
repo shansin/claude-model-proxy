@@ -42,54 +42,61 @@ claude
 
 ## Configuration
 
-Edit `config.yaml` to configure the proxy:
+Copy `.env.example` to `.env` and edit to configure the proxy:
 
-```yaml
-ollama_base_url: http://localhost:11434
-
-proxy_host: localhost
-proxy_port: 8082
-
-# Map Claude model name fragments to Ollama models (substring match, case-insensitive)
-model_map:
-  opus:    glm-4.7-flash:latest
-  sonnet:  glm-4.7-flash:latest
-  haiku:   glm-4.7-flash:latest
-  default: glm-4.7-flash:latest
-
-# Context window size per model class
-context_size:
-  opus:    32768
-  sonnet:  32768
-  haiku:   8192
-  default: 32768
+```bash
+cp .env.example .env
 ```
 
-### Environment variable overrides
+All configuration is done via environment variables (loaded from `.env`):
 
-Individual config values can be overridden with environment variables (useful for containers or `.env` files):
+```env
+# Ollama server URL
+OLLAMA_BASE_URL=http://localhost:11434
+
+# Address this proxy listens on
+PROXY_HOST=localhost
+PROXY_PORT=8082
+
+# Map Claude model name fragments to Ollama models
+OLLAMA_MODEL_MAP_OPUS=qwen3.5:27b
+OLLAMA_MODEL_MAP_SONNET=qwen3.5:27b
+OLLAMA_MODEL_MAP_HAIKU=qwen3.5:27b
+OLLAMA_MODEL_MAP_DEFAULT=qwen3.5:27b
+
+# Context window size per model class
+OLLAMA_CONTEXT_SIZE_OPUS=32768
+OLLAMA_CONTEXT_SIZE_SONNET=32768
+OLLAMA_CONTEXT_SIZE_HAIKU=8192
+OLLAMA_CONTEXT_SIZE_DEFAULT=32768
+
+# Anthropic passthrough (needed if some models fall through to Anthropic)
+# ANTHROPIC_BASE_URL=https://api.anthropic.com
+# ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Environment variables reference
 
 | Variable | Description |
 |---|---|
-| `OLLAMA_BASE_URL` | Ollama server URL |
-| `PROXY_HOST` | Host the proxy binds to |
-| `PROXY_PORT` | Port the proxy listens on |
-| `OLLAMA_MODEL_MAP_<KEY>` | Override a model mapping, e.g. `OLLAMA_MODEL_MAP_OPUS=glm-4.7-flash:latest` |
-| `OLLAMA_CONTEXT_SIZE_<KEY>` | Override context size, e.g. `OLLAMA_CONTEXT_SIZE_SONNET=32768` |
-| `CONFIG_PATH` | Path to a custom config file |
-
-See `.env.example` for a template.
+| `OLLAMA_BASE_URL` | Ollama server URL (default: `http://localhost:11434`) |
+| `PROXY_HOST` | Host the proxy binds to (default: `localhost`) |
+| `PROXY_PORT` | Port the proxy listens on (default: `8082`) |
+| `OLLAMA_MODEL_MAP_<KEY>` | Model mapping, e.g. `OLLAMA_MODEL_MAP_OPUS=qwen3.5:27b` |
+| `OLLAMA_CONTEXT_SIZE_<KEY>` | Context size, e.g. `OLLAMA_CONTEXT_SIZE_SONNET=32768` |
+| `ANTHROPIC_BASE_URL` | Anthropic API URL for passthrough (default: `https://api.anthropic.com`) |
+| `ANTHROPIC_API_KEY` | API key for Anthropic passthrough |
 
 ## Model routing
 
-When a request arrives for a Claude model (e.g. `claude-sonnet-4-6`), the proxy does a **case-insensitive substring match** against the keys in `model_map`. The first matching key wins; if nothing matches, `default` is used.
+When a request arrives for a Claude model (e.g. `claude-sonnet-4-6`), the proxy does a **case-insensitive substring match** against the model map keys. The first matching key wins; if nothing matches, `default` is used. If no model map entries are defined, all requests are forwarded to Anthropic.
 
-| Claude model contains | `config.yaml` key | Env var override             |
-|-----------------------|-------------------|------------------------------|
-| `opus`                | `opus`            | `OLLAMA_MODEL_MAP_OPUS`      |
-| `sonnet`              | `sonnet`          | `OLLAMA_MODEL_MAP_SONNET`    |
-| `haiku`               | `haiku`           | `OLLAMA_MODEL_MAP_HAIKU`     |
-| *(no match)*          | `default`         | `OLLAMA_MODEL_MAP_DEFAULT`   |
+| Claude model contains | Env var                      |
+|-----------------------|------------------------------|
+| `opus`                | `OLLAMA_MODEL_MAP_OPUS`      |
+| `sonnet`              | `OLLAMA_MODEL_MAP_SONNET`    |
+| `haiku`               | `OLLAMA_MODEL_MAP_HAIKU`     |
+| *(no match)*          | `OLLAMA_MODEL_MAP_DEFAULT`   |
 
 ## API endpoints
 
