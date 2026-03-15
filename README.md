@@ -91,6 +91,8 @@ OLLAMA_CONTEXT_SIZE_DEFAULT=32768
 
 When a request arrives for a Claude model (e.g. `claude-sonnet-4-6`), the proxy does a **case-insensitive substring match** against the model map keys. The first matching key wins; if nothing matches, `default` is used. If no model map entries are defined, all requests are forwarded to Anthropic.
 
+You can also set a model map entry to the special value `anthropic` to explicitly forward requests for that model directly to the real Anthropic API instead of a local Ollama model.
+
 | Claude model contains | Env var                      |
 |-----------------------|------------------------------|
 | `opus`                | `OLLAMA_MODEL_MAP_OPUS`      |
@@ -105,3 +107,13 @@ When a request arrives for a Claude model (e.g. `claude-sonnet-4-6`), the proxy 
 | `POST /v1/messages` | Anthropic Messages API — supports streaming and non-streaming |
 | `GET /v1/models` | Returns stub Claude model list so client checks pass |
 | `GET /health` | Health check — returns current Ollama URL and model map |
+
+## Benchmarking Models
+
+The project includes a `benchmark_model.sh` script to test and compare the performance of your installed Ollama models. It tests both code generation (Python) and layout generation (HTML) tasks.
+
+```bash
+./benchmark_model.sh
+```
+
+This will run sequentially through all models returned by `ollama list`. The script will output its progress to the terminal and generate a CSV report in the `benchmark-reports/` directory containing detailed performance metrics such as generation tokens per second, prompt processing speed, and time to first response.
